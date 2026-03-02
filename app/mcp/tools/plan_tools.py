@@ -310,6 +310,7 @@ async def cancel_plan(
         target = await crud_target.get(db, plan.target_id)
         await verify_best_pal_owns_go_getter(db, caller_id, target.go_getter_id)
         from app.models.plan import PlanStatus
+
         plan.status = PlanStatus.cancelled
         db.add(plan)
         await db.commit()

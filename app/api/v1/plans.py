@@ -201,6 +201,7 @@ async def delete_plan(
     if not plan:
         raise HTTPException(404, "Plan not found")
     from sqlalchemy import func
+
     result = await db.execute(
         select(func.count()).select_from(WeeklyMilestone).where(WeeklyMilestone.plan_id == plan_id)
     )

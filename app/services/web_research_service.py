@@ -15,8 +15,18 @@ from app.services import llm_service
 logger = logging.getLogger(__name__)
 
 _GRADE_CN = {
-    "1": "一", "2": "二", "3": "三", "4": "四", "5": "五", "6": "六",
-    "7": "七", "8": "八", "9": "九", "10": "十", "11": "十一", "12": "十二",
+    "1": "一",
+    "2": "二",
+    "3": "三",
+    "4": "四",
+    "5": "五",
+    "6": "六",
+    "7": "七",
+    "8": "八",
+    "9": "九",
+    "10": "十",
+    "11": "十一",
+    "12": "十二",
 }
 
 _EXTRACT_SYSTEM = (
@@ -85,9 +95,7 @@ async def _jina_fetch(url: str) -> str:
         return ""
 
 
-async def _extract_materials(
-    search_results: list[dict], fetched_contents: list[str]
-) -> list[dict]:
+async def _extract_materials(search_results: list[dict], fetched_contents: list[str]) -> list[dict]:
     """Use LLM to extract structured materials from combined search + fetch results."""
     content_blocks = []
     for i, result in enumerate(search_results):

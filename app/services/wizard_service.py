@@ -283,11 +283,13 @@ async def confirm(db: AsyncSession, wizard: GoalGroupWizard) -> tuple[GoalGroup,
                 )
             )
             for old_plan in existing_active.scalars().all():
-                superseded_plans.append({
-                    "plan_id": old_plan.id,
-                    "title": old_plan.title,
-                    "target_id": old_plan.target_id,
-                })
+                superseded_plans.append(
+                    {
+                        "plan_id": old_plan.id,
+                        "title": old_plan.title,
+                        "target_id": old_plan.target_id,
+                    }
+                )
                 old_plan.status = PlanStatus.completed
                 db.add(old_plan)
 

@@ -89,7 +89,7 @@ def _build_user_prompt(
         prompt += "\n## 参考教学资料（来自小红书等平台）\n"
         for mat in reference_materials[:5]:
             prompt += f"- 《{mat['title']}》({mat.get('source', '')})\n"
-            for kp in mat.get('key_points', [])[:4]:
+            for kp in mat.get("key_points", [])[:4]:
                 prompt += f"  • {kp}\n"
     return prompt
 
