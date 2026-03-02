@@ -392,7 +392,7 @@ async def _run_web_research(
 
     reference_materials: dict = {}
     search_errors: dict = {}
-    for tid, res in zip(ordered_ids, raw_results):
+    for tid, res in zip(ordered_ids, raw_results, strict=False):
         if isinstance(res, Exception):
             logger.warning("Web research failed for target %d: %s", tid, res)
             search_errors[str(tid)] = str(res)
