@@ -48,6 +48,10 @@ class Plan(Base, TimestampMixin):
     group_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("goal_groups.id"), nullable=True
     )
+    # Wizard that generated this plan as a draft (null for standalone / re-plan flows)
+    wizard_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("goal_group_wizards.id", ondelete="SET NULL"), nullable=True
+    )
 
     # Relationships
     target: Mapped["Target"] = relationship("Target", back_populates="plans")

@@ -7,7 +7,26 @@ Conversation flow driven by the LLM:
     →  [get_wizard_status to read risks]
     →  confirm_goal_group          (if feasibility_passed)
     →  adjust_wizard + confirm     (if blockers need fixing)
-    →  cancel_goal_group_wizard    (at any stage to abort)
+    →  cancel_goal_group_wizard    (see cancel semantics below)
+
+State transitions (scope / targets / constraints / confirm / adjust / cancel)
+are driven through the LangGraph wizard graph.  Read-only tools (status,
+sources, feasibility) still query the DB directly.
+
+Cancel semantics
+----------------
+cancel_goal_group_wizard is cooperative, not preemptive:
+
+• When the wizard is waiting for input (scope / targets / constraints /
+  human_gate): the cancel is delivered immediately through the graph and all
+  committed draft plans are cancelled synchronously.
+
+• When generation is in progress (research / generate_plans / feasibility):
+  the wizard DB record is cancelled immediately, and all draft plans already
+  committed at that moment are cancelled.  Any LLM calls still in flight
+  complete in the background and their plans are also cancelled once they
+  commit (because plan.wizard_id links them back to this wizard).
+  There is no preemptive signal to stop the in-flight LLM calls.
 """
 
 import logging
@@ -23,6 +42,13 @@ from app.crud import wizards as crud_wizard
 from app.models.goal_group_wizard import GoalGroupWizard
 from app.models.target import Target
 from app.services import wizard_service
+from app.services.wizard_graph import (
+    INTERRUPT_NODES,
+    Command,
+    WizardState,
+    assert_graph_awaiting,
+    get_wizard_graph,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +129,22 @@ def _build_constraints_dict(
     }
 
 
+def _initial_graph_state(wizard_id: int, go_getter_id: int) -> WizardState:
+    return {
+        "wizard_id": wizard_id,
+        "go_getter_id": go_getter_id,
+        "status": "collecting_scope",
+        "human_decision": "",
+        "error": "",
+        "adjust_patch": {},
+        "confirm_result": {},
+    }
+
+
+def _graph_config(wizard_id: int) -> dict:
+    return {"configurable": {"thread_id": str(wizard_id)}}
+
+
 # ---------------------------------------------------------------------------
 # MCP tools
 # ---------------------------------------------------------------------------
@@ -136,7 +178,18 @@ async def start_goal_group_wizard(
         await verify_best_pal_owns_go_getter(db, caller_id, go_getter_id)
         wizard = await wizard_service.create_wizard(db, go_getter_id=go_getter_id)
         await db.commit()
-        return _wizard_to_dict(wizard)
+        wizard_id = wizard.id
+        wizard_dict = _wizard_to_dict(wizard)
+
+    # Initialize graph thread — scope_node immediately calls interrupt() so
+    # ainvoke returns quickly without doing any further DB work.
+    graph = get_wizard_graph()
+    await graph.ainvoke(
+        _initial_graph_state(wizard_id, go_getter_id),
+        config=_graph_config(wizard_id),
+    )
+
+    return wizard_dict
 
 
 @mcp.tool()
@@ -208,16 +261,23 @@ async def set_wizard_scope(
     async with AsyncSessionLocal() as db:
         await require_role(db, caller_id, [Role.admin, Role.best_pal])
         await verify_best_pal_owns_go_getter(db, caller_id, go_getter_id)
+
+    graph = get_wizard_graph()
+    await assert_graph_awaiting(graph, wizard_id, "scope")
+    await graph.ainvoke(
+        Command(
+            resume={
+                "title": title,
+                "description": description,
+                "start_date": date.fromisoformat(start_date),
+                "end_date": date.fromisoformat(end_date),
+            }
+        ),
+        config=_graph_config(wizard_id),
+    )
+
+    async with AsyncSessionLocal() as db:
         wizard = await _load_wizard(db, wizard_id, go_getter_id)
-        wizard = await wizard_service.set_scope(
-            db,
-            wizard,
-            title=title,
-            description=description,
-            start_date=date.fromisoformat(start_date),
-            end_date=date.fromisoformat(end_date),
-        )
-        await db.commit()
         return _wizard_to_dict(wizard)
 
 
@@ -244,18 +304,26 @@ async def set_wizard_targets(
     async with AsyncSessionLocal() as db:
         await require_role(db, caller_id, [Role.admin, Role.best_pal])
         await verify_best_pal_owns_go_getter(db, caller_id, go_getter_id)
+
+    # Pass subcategory_id=0 — wizard_service.set_targets normalises it from DB
+    target_specs = [
+        {
+            "target_id": tid,
+            "subcategory_id": 0,
+            "priority": priorities[i] if priorities else 3,
+        }
+        for i, tid in enumerate(target_ids)
+    ]
+
+    graph = get_wizard_graph()
+    await assert_graph_awaiting(graph, wizard_id, "targets")
+    await graph.ainvoke(
+        Command(resume={"target_specs": target_specs}),
+        config=_graph_config(wizard_id),
+    )
+
+    async with AsyncSessionLocal() as db:
         wizard = await _load_wizard(db, wizard_id, go_getter_id)
-        # Pass subcategory_id=0 — wizard_service.set_targets normalises it from DB
-        target_specs = [
-            {
-                "target_id": tid,
-                "subcategory_id": 0,
-                "priority": priorities[i] if priorities else 3,
-            }
-            for i, tid in enumerate(target_ids)
-        ]
-        wizard = await wizard_service.set_targets(db, wizard, target_specs=target_specs)
-        await db.commit()
         return _wizard_to_dict(wizard)
 
 
@@ -289,6 +357,7 @@ async def set_wizard_constraints(
         raise ValueError("target_ids and daily_minutes_list must have the same length")
     if preferred_days_list is not None and len(preferred_days_list) != len(target_ids):
         raise ValueError("preferred_days_list must have the same length as target_ids")
+
     async with AsyncSessionLocal() as db:
         await require_role(db, caller_id, [Role.admin, Role.best_pal])
         await verify_best_pal_owns_go_getter(db, caller_id, go_getter_id)
@@ -305,8 +374,16 @@ async def set_wizard_constraints(
         constraints = _build_constraints_dict(
             target_ids, sub_map, daily_minutes_list, preferred_days_list
         )
-        wizard = await wizard_service.set_constraints(db, wizard, constraints=constraints)
-        await db.commit()
+
+    graph = get_wizard_graph()
+    await assert_graph_awaiting(graph, wizard_id, "save_constraints")
+    await graph.ainvoke(
+        Command(resume={"constraints": constraints}),
+        config=_graph_config(wizard_id),
+    )
+
+    async with AsyncSessionLocal() as db:
+        wizard = await _load_wizard(db, wizard_id, go_getter_id)
         return _wizard_to_dict(wizard)
 
 
@@ -344,8 +421,6 @@ async def adjust_wizard(
         patch: dict = {}
 
         # ── Resolve authoritative subcategory_ids from DB for new target list ──
-        # Must happen before building either target_specs or constraints so both
-        # use the same verified mapping (no fallback-to-0 that collapses keys).
         db_sub_map: dict[int, int] = {}
         if target_ids is not None:
             if priorities is not None and len(priorities) != len(target_ids):
@@ -362,7 +437,6 @@ async def adjust_wizard(
 
         # ── Update constraints ────────────────────────────────────────────
         if daily_minutes_list is not None:
-            # Determine the ordered target list to key constraints by
             ref_ids = (
                 target_ids
                 if target_ids is not None
@@ -375,7 +449,6 @@ async def adjust_wizard(
                 )
             if preferred_days_list is not None and len(preferred_days_list) != len(ref_ids):
                 raise ValueError("preferred_days_list must have the same length as target_ids")
-            # Use DB-resolved map for new targets; wizard's stored specs for unchanged ones.
             stored_map = _subcategory_map_from_specs(wizard.target_specs or [])
             sub_map = {tid: db_sub_map.get(tid) or stored_map[tid] for tid in ref_ids}
             patch["constraints"] = _build_constraints_dict(
@@ -385,8 +458,15 @@ async def adjust_wizard(
         if not patch:
             raise ValueError("Provide at least one of: target_ids, daily_minutes_list")
 
-        wizard = await wizard_service.adjust(db, wizard, patch=patch)
-        await db.commit()
+    graph = get_wizard_graph()
+    await assert_graph_awaiting(graph, wizard_id, "human_gate")
+    await graph.ainvoke(
+        Command(resume={"decision": "adjust", "patch": patch}),
+        config=_graph_config(wizard_id),
+    )
+
+    async with AsyncSessionLocal() as db:
+        wizard = await _load_wizard(db, wizard_id, go_getter_id)
         return _wizard_to_dict(wizard)
 
 
@@ -407,21 +487,25 @@ async def confirm_goal_group(
     async with AsyncSessionLocal() as db:
         await require_role(db, caller_id, [Role.admin, Role.best_pal])
         await verify_best_pal_owns_go_getter(db, caller_id, go_getter_id)
-        wizard = await _load_wizard(db, wizard_id, go_getter_id)
-        group, superseded_plans = await wizard_service.confirm(db, wizard)
-        await db.commit()
-        return {
-            "goal_group_id": group.id,
-            "title": group.title,
-            "go_getter_id": group.go_getter_id,
-            "start_date": str(group.start_date),
-            "end_date": str(group.end_date),
-            "wizard_id": wizard_id,
-            "status": "confirmed",
-            # Plans that were active before the wizard and are now completed.
-            # Empty list means this is a fresh start with no prior plans.
-            "superseded_plans": superseded_plans,
-        }
+
+    graph = get_wizard_graph()
+    await assert_graph_awaiting(graph, wizard_id, "human_gate")
+    result = await graph.ainvoke(
+        Command(resume={"decision": "confirm"}),
+        config=_graph_config(wizard_id),
+    )
+
+    confirm_data = result.get("confirm_result", {})
+    return {
+        "goal_group_id": confirm_data.get("goal_group_id"),
+        "title": confirm_data.get("title"),
+        "go_getter_id": confirm_data.get("go_getter_id"),
+        "start_date": confirm_data.get("start_date"),
+        "end_date": confirm_data.get("end_date"),
+        "wizard_id": wizard_id,
+        "status": "confirmed",
+        "superseded_plans": confirm_data.get("superseded_plans", []),
+    }
 
 
 @mcp.tool()
@@ -430,7 +514,16 @@ async def cancel_goal_group_wizard(
     go_getter_id: int,
     x_telegram_chat_id: Optional[int] = None,
 ) -> dict:
-    """Cancel the wizard and discard all draft plans. Safe to call at any stage.
+    """Cancel the wizard and discard all committed draft plans.
+
+    When waiting for user input (scope/targets/constraints/human_gate): cancels
+    immediately and synchronously via the graph.
+
+    When generation is in progress: marks the wizard cancelled immediately and
+    cancels all draft plans committed so far.  In-flight LLM calls are not
+    preempted — their plans are cancelled when they commit because each plan
+    carries a wizard_id backlink.  Callers should treat this as best-effort
+    during generation.
 
     Requires best_pal/admin role.
     """
@@ -439,6 +532,23 @@ async def cancel_goal_group_wizard(
         await require_role(db, caller_id, [Role.admin, Role.best_pal])
         await verify_best_pal_owns_go_getter(db, caller_id, go_getter_id)
         wizard = await _load_wizard(db, wizard_id, go_getter_id)
-        await wizard_service.cancel_wizard(db, wizard)
-        await db.commit()
-        return {"wizard_id": wizard_id, "status": "cancelled"}
+        _ = wizard  # ownership verified
+
+    graph = get_wizard_graph()
+    snapshot = await graph.aget_state(_graph_config(wizard_id))
+    at_interrupt = bool(snapshot and snapshot.next and snapshot.next[0] in INTERRUPT_NODES)
+
+    if at_interrupt:
+        await graph.ainvoke(
+            Command(resume={"action": "cancel"}),
+            config=_graph_config(wizard_id),
+        )
+    else:
+        # Graph is mid-generation or already finished — cancel the DB record directly.
+        async with AsyncSessionLocal() as cancel_db:
+            fresh = await crud_wizard.get(cancel_db, wizard_id)
+            if fresh:
+                await wizard_service.cancel_wizard(cancel_db, fresh)
+                await cancel_db.commit()
+
+    return {"wizard_id": wizard_id, "status": "cancelled"}

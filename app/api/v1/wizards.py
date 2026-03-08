@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import require_best_pal_or_admin, verify_best_pal_owns_go_getter
 from app.crud.wizards import get as crud_get_wizard
-from app.database import get_db
+from app.database import AsyncSessionLocal, get_db
 from app.models.goal_group_wizard import GoalGroupWizard, TERMINAL_STATUSES, WizardStatus
 from app.schemas.wizard import (
     AdjustRequest,
@@ -21,6 +21,13 @@ from app.schemas.wizard import (
     WizardResponse,
 )
 from app.services import wizard_service
+from app.services.wizard_graph import (
+    INTERRUPT_NODES,
+    Command,
+    WizardState,
+    assert_graph_awaiting,
+    get_wizard_graph,
+)
 
 router = APIRouter(prefix="/wizards", tags=["wizards"])
 
@@ -82,6 +89,30 @@ async def _load_wizard_and_verify(
     return wizard
 
 
+def _graph_config(wizard_id: int) -> dict:
+    return {"configurable": {"thread_id": str(wizard_id)}}
+
+
+async def _reload_wizard(wizard_id: int) -> GoalGroupWizard:
+    """Load wizard in a fresh session (to see changes committed by graph nodes)."""
+    async with AsyncSessionLocal() as db:
+        wizard = await crud_get_wizard(db, wizard_id)
+        assert wizard is not None
+        return wizard
+
+
+def _initial_graph_state(wizard_id: int, go_getter_id: int) -> WizardState:
+    return {
+        "wizard_id": wizard_id,
+        "go_getter_id": go_getter_id,
+        "status": "collecting_scope",
+        "human_decision": "",
+        "error": "",
+        "adjust_patch": {},
+        "confirm_result": {},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -102,7 +133,22 @@ async def create_wizard(
         wizard = await wizard_service.create_wizard(db, go_getter_id=body.go_getter_id)
     except ValueError as e:
         raise HTTPException(409, str(e)) from e
-    return _build_response(wizard)
+
+    wizard_id = wizard.id
+    wizard_go_getter_id = wizard.go_getter_id
+
+    # Flush so wizard.id is available; middleware commits at request end.
+    # We capture the response before initialising the graph thread (which
+    # hits interrupt() immediately and needs no DB access).
+    response = _build_response(wizard)
+
+    graph = get_wizard_graph()
+    await graph.ainvoke(
+        _initial_graph_state(wizard_id, wizard_go_getter_id),
+        config=_graph_config(wizard_id),
+    )
+
+    return response
 
 
 @router.get("/{wizard_id}", response_model=WizardResponse)
@@ -130,18 +176,25 @@ async def set_scope(
     """
     wizard = await _load_wizard_and_verify(wizard_id, chat_id, db)
     _assert_active(wizard)
+
+    graph = get_wizard_graph()
     try:
-        wizard = await wizard_service.set_scope(
-            db,
-            wizard,
-            title=body.title,
-            description=body.description,
-            start_date=body.start_date,
-            end_date=body.end_date,
+        await assert_graph_awaiting(graph, wizard_id, "scope")
+        await graph.ainvoke(
+            Command(
+                resume={
+                    "title": body.title,
+                    "description": body.description,
+                    "start_date": body.start_date,
+                    "end_date": body.end_date,
+                }
+            ),
+            config=_graph_config(wizard_id),
         )
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
-    return _build_response(wizard)
+
+    return _build_response(await _reload_wizard(wizard_id))
 
 
 @router.post("/{wizard_id}/targets", response_model=WizardResponse)
@@ -159,11 +212,18 @@ async def set_targets(
     wizard = await _load_wizard_and_verify(wizard_id, chat_id, db)
     _assert_active(wizard)
     target_specs_raw: list[dict[str, Any]] = [s.model_dump() for s in body.target_specs]
+
+    graph = get_wizard_graph()
     try:
-        wizard = await wizard_service.set_targets(db, wizard, target_specs=target_specs_raw)
+        await assert_graph_awaiting(graph, wizard_id, "targets")
+        await graph.ainvoke(
+            Command(resume={"target_specs": target_specs_raw}),
+            config=_graph_config(wizard_id),
+        )
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
-    return _build_response(wizard)
+
+    return _build_response(await _reload_wizard(wizard_id))
 
 
 @router.post("/{wizard_id}/constraints", response_model=WizardResponse)
@@ -181,11 +241,18 @@ async def set_constraints(
     wizard = await _load_wizard_and_verify(wizard_id, chat_id, db)
     _assert_active(wizard)
     constraints_raw = {k: v.model_dump() for k, v in body.constraints.items()}
+
+    graph = get_wizard_graph()
     try:
-        wizard = await wizard_service.set_constraints(db, wizard, constraints=constraints_raw)
+        await assert_graph_awaiting(graph, wizard_id, "save_constraints")
+        await graph.ainvoke(
+            Command(resume={"constraints": constraints_raw}),
+            config=_graph_config(wizard_id),
+        )
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
-    return _build_response(wizard)
+
+    return _build_response(await _reload_wizard(wizard_id))
 
 
 @router.get("/{wizard_id}/feasibility", response_model=WizardResponse)
@@ -217,11 +284,18 @@ async def adjust(
         patch["target_specs"] = [s.model_dump() for s in body.target_specs]
     if body.constraints is not None:
         patch["constraints"] = {k: v.model_dump() for k, v in body.constraints.items()}
+
+    graph = get_wizard_graph()
     try:
-        wizard = await wizard_service.adjust(db, wizard, patch=patch)
+        await assert_graph_awaiting(graph, wizard_id, "human_gate")
+        await graph.ainvoke(
+            Command(resume={"decision": "adjust", "patch": patch}),
+            config=_graph_config(wizard_id),
+        )
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
-    return _build_response(wizard)
+
+    return _build_response(await _reload_wizard(wizard_id))
 
 
 @router.post("/{wizard_id}/confirm", response_model=WizardResponse)
@@ -236,14 +310,18 @@ async def confirm(
     """
     wizard = await _load_wizard_and_verify(wizard_id, chat_id, db)
     _assert_active(wizard)
+
+    graph = get_wizard_graph()
     try:
-        await wizard_service.confirm(db, wizard)
+        await assert_graph_awaiting(graph, wizard_id, "human_gate")
+        await graph.ainvoke(
+            Command(resume={"decision": "confirm"}),
+            config=_graph_config(wizard_id),
+        )
     except ValueError as e:
         raise HTTPException(409, str(e)) from e
-    # Reload wizard after confirm
-    wizard = await crud_get_wizard(db, wizard_id)
-    assert wizard is not None
-    return _build_response(wizard)
+
+    return _build_response(await _reload_wizard(wizard_id))
 
 
 @router.delete("/{wizard_id}", response_model=WizardResponse)
@@ -252,12 +330,34 @@ async def cancel_wizard(
     db: Annotated[AsyncSession, Depends(get_db)],
     chat_id: Annotated[int, Depends(require_best_pal_or_admin)],
 ):
-    """Cancel the wizard and clean up draft plans."""
+    """Cancel the wizard and discard all committed draft plans.
+
+    When waiting for user input: cancels immediately via the graph (synchronous).
+    When generation is in progress: marks the wizard cancelled immediately; plans
+    already committed are cancelled, in-flight LLM calls are not preempted but
+    their plans are cancelled on commit via the wizard_id backlink.
+    """
     wizard = await _load_wizard_and_verify(wizard_id, chat_id, db)
-    await wizard_service.cancel_wizard(db, wizard)
-    wizard = await crud_get_wizard(db, wizard_id)
-    assert wizard is not None
-    return _build_response(wizard)
+    _ = wizard  # ownership verified
+
+    graph = get_wizard_graph()
+    snapshot = await graph.aget_state(_graph_config(wizard_id))
+    at_interrupt = bool(snapshot and snapshot.next and snapshot.next[0] in INTERRUPT_NODES)
+
+    if at_interrupt:
+        await graph.ainvoke(
+            Command(resume={"action": "cancel"}),
+            config=_graph_config(wizard_id),
+        )
+    else:
+        # Graph is mid-generation or already finished — cancel the DB record directly.
+        async with AsyncSessionLocal() as cancel_db:
+            fresh = await crud_get_wizard(cancel_db, wizard_id)
+            if fresh:
+                await wizard_service.cancel_wizard(cancel_db, fresh)
+                await cancel_db.commit()
+
+    return _build_response(await _reload_wizard(wizard_id))
 
 
 @router.get("/{wizard_id}/sources")
