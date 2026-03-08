@@ -52,32 +52,41 @@ class HmacMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    from app.services.wizard_checkpointer import _DEV_CHECKPOINTER_PATH
+    from app.services.wizard_graph import build_wizard_graph, set_wizard_graph
+
     # Startup
     logger.info("Starting Goal Agent...")
     setup_scheduler()
     scheduler.start()
     logger.info("APScheduler started with %d jobs", len(scheduler.get_jobs()))
 
-    bot_task = None
-    if settings.TELEGRAM_GO_GETTER_BOT_TOKEN:
-        from app.bots.go_getter_bot import start_go_getter_bot
+    async with AsyncSqliteSaver.from_conn_string(_DEV_CHECKPOINTER_PATH) as checkpointer:
+        set_wizard_graph(build_wizard_graph(checkpointer))
+        logger.info("Wizard graph: AsyncSqliteSaver at %s", _DEV_CHECKPOINTER_PATH)
 
-        bot_task = asyncio.create_task(start_go_getter_bot())
-        logger.info("Telegram go getter bot task started")
-    else:
-        logger.info("TELEGRAM_GO_GETTER_BOT_TOKEN not set – go getter bot disabled")
+        bot_task = None
+        if settings.TELEGRAM_GO_GETTER_BOT_TOKEN:
+            from app.bots.go_getter_bot import start_go_getter_bot
 
-    yield
+            bot_task = asyncio.create_task(start_go_getter_bot())
+            logger.info("Telegram go getter bot task started")
+        else:
+            logger.info("TELEGRAM_GO_GETTER_BOT_TOKEN not set – go getter bot disabled")
 
-    # Shutdown
-    if bot_task:
-        bot_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await bot_task
-        logger.info("Telegram go getter bot stopped")
+        yield
 
-    scheduler.shutdown(wait=False)
-    logger.info("APScheduler stopped")
+        # Shutdown
+        if bot_task:
+            bot_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await bot_task
+            logger.info("Telegram go getter bot stopped")
+
+        scheduler.shutdown(wait=False)
+        logger.info("APScheduler stopped")
 
 
 app = FastAPI(

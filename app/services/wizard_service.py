@@ -332,6 +332,240 @@ async def cancel_wizard(db: AsyncSession, wizard: GoalGroupWizard) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Graph-node service functions (thin, called by wizard_graph.py nodes)
+# ---------------------------------------------------------------------------
+
+
+async def save_constraints_to_db(
+    db: AsyncSession,
+    wizard: GoalGroupWizard,
+    constraints: dict,
+) -> GoalGroupWizard:
+    """Save constraints to DB and set status=generating_plans. Does not trigger generation."""
+    _assert_not_terminal(wizard)
+    str_constraints = {str(k): v for k, v in constraints.items()}
+    wizard = await crud_wizard.update_wizard(
+        db,
+        wizard,
+        constraints=str_constraints,
+        status=WizardStatus.generating_plans,
+    )
+    return wizard
+
+
+async def run_web_research_step(db: AsyncSession, wizard: GoalGroupWizard) -> GoalGroupWizard:
+    """Load GoGetter.grade and run web research for all targets (best-effort)."""
+    from app.models.go_getter import GoGetter
+
+    gg_result = await db.execute(select(GoGetter).where(GoGetter.id == wizard.go_getter_id))
+    go_getter = gg_result.scalar_one_or_none()
+    if go_getter is None:
+        return wizard
+    await _run_web_research(db, wizard, go_getter.grade)
+    return wizard
+
+
+async def generate_plans_parallel(
+    db: AsyncSession,
+    wizard: GoalGroupWizard,
+) -> tuple[list[int], list[dict]]:
+    """Generate draft plans for all targets in parallel using independent DB sessions.
+
+    Each target gets its own AsyncSessionLocal session that commits after plan creation,
+    so partial success is possible: some plans may succeed while others fail.
+    Returns (plan_ids, errors).
+    """
+    from app.services import plan_generator
+    from app.models.target import Target
+    from app.models.go_getter import GoGetter
+    from app.database import AsyncSessionLocal
+
+    gg_result = await db.execute(select(GoGetter).where(GoGetter.id == wizard.go_getter_id))
+    go_getter = gg_result.scalar_one_or_none()
+    if go_getter is None:
+        return [], [{"error": "GoGetter not found"}]
+
+    target_specs = wizard.target_specs or []
+    reference_materials = wizard.reference_materials or {}
+
+    async def _generate_one(spec: dict) -> tuple[int | None, dict | None]:
+        from app.models.goal_group_wizard import GoalGroupWizard as _WizardModel
+
+        target_id = spec.get("target_id")
+        subcategory_id = spec.get("subcategory_id")
+        async with AsyncSessionLocal() as gen_db:
+            t_result = await gen_db.execute(select(Target).where(Target.id == target_id))
+            target = t_result.scalar_one_or_none()
+            if target is None:
+                return None, {"target_id": target_id, "error": "Target not found"}
+            if target.go_getter_id != wizard.go_getter_id:
+                return None, {
+                    "target_id": target_id,
+                    "error": f"Target does not belong to go_getter {wizard.go_getter_id}",
+                }
+
+            constraint = {}
+            if wizard.constraints and subcategory_id is not None:
+                constraint = (
+                    wizard.constraints.get(str(subcategory_id))
+                    or wizard.constraints.get(subcategory_id)
+                    or {}
+                )
+            daily_minutes = constraint.get("daily_minutes") if constraint else None
+            preferred_days = constraint.get("preferred_days") if constraint else None
+
+            try:
+                new_plan = await plan_generator.generate_plan(
+                    db=gen_db,
+                    target=target,
+                    pupil_name=go_getter.name,
+                    grade=go_getter.grade,
+                    start_date=wizard.start_date,
+                    end_date=wizard.end_date,
+                    daily_study_minutes=daily_minutes,
+                    preferred_days=preferred_days,
+                    initial_status=PlanStatus.draft,
+                    deactivate_existing=False,
+                    reference_materials=reference_materials.get(str(target_id)),
+                    wizard_id=wizard.id,
+                )
+                # Atomically register plan_id on the wizard row before committing.
+                # SELECT FOR UPDATE serializes concurrent appends from parallel tasks
+                # so draft_plan_ids is crash-safe: if the process dies after this
+                # commit, the ID is already persisted and cleanup can find the plan.
+                w_result = await gen_db.execute(
+                    select(_WizardModel).where(_WizardModel.id == wizard.id).with_for_update()
+                )
+                w = w_result.scalar_one_or_none()
+                if w is not None:
+                    existing_ids = list(w.draft_plan_ids or [])
+                    if new_plan.id not in existing_ids:
+                        existing_ids.append(new_plan.id)
+                        w.draft_plan_ids = existing_ids
+                        gen_db.add(w)
+                await gen_db.commit()
+                return new_plan.id, None
+            except Exception as exc:
+                logger.exception(
+                    "Wizard %d: plan generation failed for target %d: %s",
+                    wizard.id,
+                    target_id,
+                    exc,
+                )
+                return None, {"target_id": target_id, "error": str(exc)}
+
+    results = await asyncio.gather(*[_generate_one(spec) for spec in target_specs])
+
+    plan_ids: list[int] = []
+    errors: list[dict] = []
+    for plan_id, error in results:
+        if plan_id is not None:
+            plan_ids.append(plan_id)
+        if error is not None:
+            errors.append(error)
+
+    return plan_ids, errors
+
+
+async def save_plan_gen_results(
+    db: AsyncSession,
+    wizard: GoalGroupWizard,
+    plan_ids: list[int],
+    errors: list[dict],
+) -> GoalGroupWizard:
+    """Persist draft_plan_ids and generation_errors to DB."""
+    wizard = await crud_wizard.update_wizard(
+        db,
+        wizard,
+        draft_plan_ids=plan_ids,
+        generation_errors=errors if errors else None,
+    )
+    return wizard
+
+
+async def run_feasibility_step(db: AsyncSession, wizard: GoalGroupWizard) -> GoalGroupWizard:
+    """Run feasibility check + LLM enrichment and write results to DB.
+
+    Re-checks terminal state right before writing status so that a concurrent
+    mid-generation cancel (which writes directly to DB) cannot be overwritten
+    by the feasibility status update.
+    """
+    from app.services.feasibility_service import check_feasibility, enrich_with_llm
+
+    risks = await check_feasibility(db, wizard)
+    risks = await enrich_with_llm(risks)
+    passed = not any(r.is_blocker for r in risks)
+
+    # Reload wizard to detect any concurrent status change (e.g. a direct-DB
+    # cancel that happened while the LLM calls above were in flight).
+    await db.refresh(wizard)
+    if wizard.status in _TERMINAL:
+        logger.info(
+            "run_feasibility_step: wizard %d became terminal (%s) during LLM work, "
+            "skipping status write",
+            wizard.id,
+            wizard.status.value,
+        )
+        return wizard
+
+    wizard = await crud_wizard.update_wizard(
+        db,
+        wizard,
+        feasibility_risks=[r.to_dict() for r in risks],
+        feasibility_passed=1 if passed else 0,
+        status=WizardStatus.feasibility_check,
+    )
+    return wizard
+
+
+async def save_adjust_patch(
+    db: AsyncSession,
+    wizard: GoalGroupWizard,
+    *,
+    patch: dict,
+) -> GoalGroupWizard:
+    """Save patch fields to wizard and cancel old draft plans. Does not run generation."""
+    _assert_not_terminal(wizard)
+
+    updates: dict = {"status": WizardStatus.adjusting}
+
+    if "target_specs" in patch and patch["target_specs"] is not None:
+        from app.models.target import Target as _Target
+
+        validated: list[dict] = []
+        for spec in patch["target_specs"]:
+            target_id = spec.get("target_id")
+            t_result = await db.execute(select(_Target).where(_Target.id == target_id))
+            target = t_result.scalar_one_or_none()
+            if target is None:
+                raise ValueError(f"Target {target_id} not found.")
+            if target.go_getter_id != wizard.go_getter_id:
+                raise ValueError(
+                    f"Target {target_id} does not belong to go_getter {wizard.go_getter_id}."
+                )
+            validated.append(
+                {
+                    "target_id": target_id,
+                    "subcategory_id": target.subcategory_id,
+                    "priority": spec.get("priority", 3),
+                }
+            )
+        updates["target_specs"] = validated
+
+    if "constraints" in patch and patch["constraints"] is not None:
+        new_constraints = {str(k): v for k, v in patch["constraints"].items()}
+        updates["constraints"] = new_constraints
+
+    wizard = await crud_wizard.update_wizard(db, wizard, **updates)
+
+    await _cancel_draft_plans(db, wizard)
+    wizard = await crud_wizard.update_wizard(
+        db, wizard, draft_plan_ids=[], status=WizardStatus.generating_plans
+    )
+    return wizard
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -344,10 +578,29 @@ def _assert_not_terminal(wizard: GoalGroupWizard) -> None:
 
 
 async def _cancel_draft_plans(db: AsyncSession, wizard: GoalGroupWizard) -> None:
-    """Cancel all draft plans tracked by wizard.draft_plan_ids."""
-    if not wizard.draft_plan_ids:
+    """Cancel all draft plans belonging to this wizard.
+
+    Uses two complementary queries:
+    1. Plans explicitly tracked in wizard.draft_plan_ids (the normal case).
+    2. Any plans with wizard_id == wizard.id (catches orphans committed after a
+       mid-generation crash before save_plan_gen_results could write their IDs).
+    """
+    ids_to_cancel: set[int] = set(wizard.draft_plan_ids or [])
+
+    # Sweep for orphans using the wizard_id backlink
+    orphan_result = await db.execute(
+        select(Plan).where(
+            Plan.wizard_id == wizard.id,
+            Plan.status == PlanStatus.draft,
+        )
+    )
+    for orphan in orphan_result.scalars().all():
+        ids_to_cancel.add(orphan.id)
+
+    if not ids_to_cancel:
         return
-    for plan_id in wizard.draft_plan_ids:
+
+    for plan_id in ids_to_cancel:
         result = await db.execute(select(Plan).where(Plan.id == plan_id))
         plan = result.scalar_one_or_none()
         if plan and plan.status == PlanStatus.draft:
@@ -485,6 +738,7 @@ async def _generate_and_check(db: AsyncSession, wizard: GoalGroupWizard) -> None
                 initial_status=PlanStatus.draft,
                 deactivate_existing=False,  # P0: preserve live plans until confirm
                 reference_materials=research_results.get(str(target_id)),
+                wizard_id=wizard.id,
             )
             draft_plan_ids.append(new_plan.id)
         except Exception as exc:

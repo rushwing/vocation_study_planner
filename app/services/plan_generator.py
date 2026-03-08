@@ -107,6 +107,7 @@ async def generate_plan(
     reference_materials: list[dict] | None = None,
     initial_status: PlanStatus = PlanStatus.active,
     deactivate_existing: bool = True,
+    wizard_id: int | None = None,
 ) -> Plan:
     """
     Call Kimi to generate a structured plan, persist to DB, return Plan object.
@@ -178,6 +179,7 @@ async def generate_plan(
         status=initial_status,
         llm_prompt_tokens=prompt_tokens,
         llm_completion_tokens=completion_tokens,
+        wizard_id=wizard_id,
     )
     db.add(plan)
     await db.flush()

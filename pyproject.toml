@@ -22,6 +22,8 @@ dependencies = [
     "apscheduler>=3.10",
     "pygithub>=2.5",
     "python-telegram-bot>=20.0",
+    "langgraph>=1.0",
+    "langgraph-checkpoint-sqlite>=2.0",
 ]
 
 [project.optional-dependencies]
