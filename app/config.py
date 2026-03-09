@@ -40,7 +40,8 @@ class Settings(BaseSettings):
     # Leave empty in dev/test environments to skip verification.
     HMAC_SECRET: str = ""
 
-    # Brave Search API
+    # Web search (Tavily primary, Brave fallback on quota)
+    TAVILY_API_KEY: str = ""
     BRAVE_API_KEY: str = ""
 
     # Bootstrap admin chat IDs (comma-separated)
